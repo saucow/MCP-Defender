@@ -9,20 +9,24 @@
 
 import http from 'node:http';
 import { URL } from 'node:url';
+import { EventEmitter } from 'node:events';
+import { UtilityProcess } from 'electron';
 import { DefenderServerEvent, DefenderServiceEvent, DefenderStatus } from '../services/defender/types';
 import { Signature } from '../services/signatures/types';
+import { MCPApplication, ProtectedServerConfig, MCPDefenderEnvVar } from '../services/configurations/types.js';
+import { ScanResult } from '../services/scans/types';
 import {
   verifyToolCall,
   verifyToolResponse,
   initVerification,
 } from './verification-utils.js';
+
+// Import defender types
 import { DefenderState, SSEConnection, PendingToolCall, sendMessageToParent, ScanSettings } from './common/types.js';
-import { ProtectedServerConfig, MCPApplication, MCPDefenderEnvVar } from '../services/configurations/types.js';
 
 // Import transport handlers
-import { handleSseConnection, handleMessageEndpoint } from './transports/http-sse-transport.js';
-// import { handleStreamableHttpConnection, handleStreamableHttpMessage } from './transports/streamable-http-transport.js';
 import { handleVerifyRequest, handleVerifyResponse, handleRegisterTools } from './transports/stdio-transport.js';
+import { handleStreamableHttpTransport } from './transports/streamable-http-transport.js';
 import { ScanMode } from '../services/settings/types';
 
 // Server configuration
@@ -142,7 +146,7 @@ function stopServer() {
  * Streamable HTTP transport (2025-03-26 spec):
  * - /{appName}/{serverName}           - Single MCP endpoint for both GET (SSE) and POST (messages)
  */
-function handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
+async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
   const url = new URL(req.url || '/', `http://${req.headers.host}`);
   const pathname = url.pathname;
 
@@ -227,122 +231,8 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
       return;
     }
 
-    // Handle SSE endpoints - this would be the GET connection for the old spec
-    if (pathname.endsWith('/sse')) {
-      // For SSE endpoints, we only support GET
-      if (req.method !== 'GET') {
-        res.statusCode = 405; // Method Not Allowed
-        res.setHeader('Content-Type', 'application/json');
-        res.setHeader('Allow', 'GET');
-        res.end(JSON.stringify({ error: 'Method not allowed' }));
-        return;
-      }
-
-      // Parse the URL path to extract app name and server name
-      // Expected format: /{appName}/{serverName}/sse
-      const pathParts = pathname.split('/').filter(part => part.length > 0);
-
-      if (pathParts.length >= 2) {
-        // Extract app name and server name from path
-        const appName = pathParts[0];
-        const serverName = pathParts[1];
-
-        console.log(`SSE connection with app name: ${appName}, server name: ${serverName}`);
-
-        // Add app name to request headers for downstream handlers
-        req.headers['mcp_defender_app_name'] = appName;
-
-        handleSseConnection(req, res, state);
-        return;
-      }
-
-      // Fall back to old pattern if we can't parse the path
-      console.log(`Warning: Using legacy SSE path pattern without app name: ${pathname}`);
-      handleSseConnection(req, res, state);
-      return;
-    }
-
-    // Handle message endpoints - this is the POST endpoint for clients using the old spec
-    if (pathname.includes('/message')) {
-      // Extract server name from the path
-      let serverName;
-      let appName;
-
-      // Parse the URL path
-      // Expected formats:
-      // /{appName}/{serverName}/message - new format with app name
-      // /{serverName}/message - legacy format
-      // /message - root endpoint format
-      const pathParts = pathname.split('/').filter(part => part.length > 0);
-
-      if (pathParts.length >= 2 && pathParts[pathParts.length - 1] === 'message') {
-        if (pathParts.length >= 3) {
-          // Format: /{appName}/{serverName}/message
-          appName = pathParts[0];
-          serverName = pathParts[1];
-          console.log(`Message endpoint with app name: ${appName}, server name: ${serverName}`);
-
-          // Add app name to request headers for downstream handlers
-          req.headers['mcp_defender_app_name'] = appName;
-        } else {
-          // Format: /{serverName}/message
-          serverName = pathParts[0];
-          console.log(`Legacy message endpoint format without app name: ${pathname}`);
-        }
-      } else if (pathname === '/message') {
-        // Special case for root /message - try to extract serverName from query param or use 'default'
-        // Parse query string for session ID
-        const sessionId = url.searchParams.get('sessionId');
-        console.log(`Request to root /message endpoint with sessionId: ${sessionId}`);
-
-        // Try to find an existing SSE connection with this session ID if provided
-        if (sessionId) {
-          // Look for an active SSE connection with this session ID
-          // We could enhance this by storing the session ID in the SSE connection object
-          console.log('Looking for active SSE connection with matching session ID or related information');
-
-          // For now, we'll use a default value if we can't determine it from the URL
-          serverName = 'everything';
-          appName = 'Cursor'; // Default app name
-
-          // Try to find all SSE connections and see if we can find a matching one
-          if (state.sseConnections.size > 0) {
-            console.log(`Examining ${state.sseConnections.size} active connections for session matching`);
-            for (const [id, conn] of state.sseConnections.entries()) {
-              // If we find a match, use that connection's app and server name
-              console.log(`Connection: server=${conn.serverName}, app=${conn.appName || 'unknown'}`);
-              serverName = conn.serverName;
-              appName = conn.appName || appName;
-              console.log(`Found active connection, using server=${serverName}, app=${appName}`);
-              break; // Use the first connection we find for now
-            }
-          }
-        }
-
-        // Store app name in headers for downstream handlers
-        if (appName) {
-          req.headers['mcp_defender_app_name'] = appName;
-        }
-
-        console.log(`Resolved root /message request to app: ${appName}, server: ${serverName}`);
-      }
-
-      // For message endpoints, we only support POST
-      if (req.method !== 'POST') {
-        res.statusCode = 405; // Method Not Allowed
-        res.setHeader('Content-Type', 'application/json');
-        res.setHeader('Allow', 'POST');
-        res.end(JSON.stringify({ error: 'Method not allowed' }));
-        return;
-      }
-
-      handleMessageEndpoint(req, res, serverName, state);
-      return;
-    }
-
-    // Handle Streamable HTTP transport (2025-03-26)
+    // Handle Streamable HTTP transport (2025-06-18)
     // This handles both GET and POST to the same endpoint (not ending with /sse or /message)
-    /*
     if (pathname.split('/').length >= 2 && pathname !== '/') {
       const pathParts = pathname.split('/').filter(part => part.length > 0);
 
@@ -353,46 +243,19 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
 
         console.log(`Streamable HTTP request with app name: ${appName}, server name: ${serverName}`);
 
-        // Add app name to request headers for downstream handlers
-        req.headers['mcp_defender_app_name'] = appName;
-
-        if (req.method === 'GET') {
-          // Handle GET for SSE stream connection
-          handleStreamableHttpConnection(req, res, serverName, state);
-          return;
-        } else if (req.method === 'POST') {
-          // Handle POST for JSON-RPC messages
-          handleStreamableHttpMessage(req, res, serverName, state);
-          return;
-        } else {
-          // Only GET and POST are allowed for this endpoint
-          res.statusCode = 405; // Method Not Allowed
-          res.setHeader('Content-Type', 'application/json');
-          res.setHeader('Allow', 'GET, POST');
-          res.end(JSON.stringify({ error: 'Method not allowed' }));
-          return;
-        }
-      } else {
+        // Route to the Streamable HTTP transport handler
+        await handleStreamableHttpTransport(req, res, state);
+        return;
+      } else if (pathParts.length === 1) {
         // Legacy format: /{serverName}
         const serverName = pathParts[0];
         console.log(`Legacy Streamable HTTP request for server: ${serverName}`);
 
-        if (req.method === 'GET') {
-          handleStreamableHttpConnection(req, res, serverName, state);
-          return;
-        } else if (req.method === 'POST') {
-          handleStreamableHttpMessage(req, res, serverName, state);
-          return;
-        } else {
-          res.statusCode = 405;
-          res.setHeader('Content-Type', 'application/json');
-          res.setHeader('Allow', 'GET, POST');
-          res.end(JSON.stringify({ error: 'Method not allowed' }));
-          return;
-        }
+        // Route to the Streamable HTTP transport handler
+        await handleStreamableHttpTransport(req, res, state);
+        return;
       }
     }
-    */
 
     // Default 404 handler
     res.statusCode = 404;
@@ -609,24 +472,14 @@ process.parentPort.on('message', (message: any) => {
       // Extract data from the message
       const { appName, serverName, targetUrl } = messageData;
 
-      console.log(`Starting tool discovery for ${appName}/${serverName} using target URL: ${targetUrl}`);
+      console.log(`Tool discovery for ${appName}/${serverName} at ${targetUrl} - not implemented for Streamable HTTP transport yet`);
 
-      // Dynamically import and call queryServerTools
-      import('./transports/http-sse-transport.js')
-        .then(({ queryServerTools }) => {
-          console.log(`Successfully imported queryServerTools, calling it now...`);
-          // Call the function to query tools
-          queryServerTools(targetUrl, serverName, appName)
-            .then(() => {
-              console.log(`Tool discovery request completed for ${appName}/${serverName}`);
-            })
-            .catch(error => {
-              console.error('Error discovering tools:', error);
-            });
-        })
-        .catch(error => {
-          console.error('Error importing queryServerTools:', error);
-        });
+      // TODO: Implement tool discovery for Streamable HTTP transport
+      // For now, just signal completion without discovering tools
+      sendMessageToParent({
+        type: DefenderServerEvent.TOOLS_DISCOVERY_COMPLETE,
+        data: { appName, serverName, success: false }
+      });
       break;
 
     default:
