@@ -477,8 +477,8 @@ export class ConfigurationsService extends BaseService {
 
                 // Handle based on server type
                 if ('url' in server.config) {
-                    // For SSE servers
-                    await this.discoverSSEServerTools(app.name, server.serverName);
+                    // For Streamable HTTP servers
+                    await this.discoverHttpServerTools(app.name, server.serverName);
                 } else if ('command' in server.config) {
                     // For STDIO servers
                     await this.discoverSTDIOServerTools(app.name, server.serverName);
@@ -815,13 +815,13 @@ export class ConfigurationsService extends BaseService {
                 (config as any).setConfigPath(app.configurationPath);
             }
 
-            // Get SSE proxying setting from settings service
+            // Get Streamable HTTP proxying setting from settings service
             const serviceManager = ServiceManager.getInstance();
             const settings = serviceManager.settingsService.getSettings();
-            const enableSSEProxying = settings.enableSSEProxying ?? false; // Default to false for safety
+            const enableHttpProxying = settings.enableSSEProxying ?? false; // Default to false for safety (reusing existing setting)
 
-            // Process the configuration - pass application name and SSE setting
-            const result = await config.processConfigFile(app.name, enableSSEProxying);
+            // Process the configuration - pass application name and HTTP proxying setting
+            const result = await config.processConfigFile(app.name, enableHttpProxying);
 
             // Update the application with the results
             if (result.success) {
@@ -1108,13 +1108,13 @@ export class ConfigurationsService extends BaseService {
     }
 
     /**
-     * Discover tools for an SSE server
+     * Discover tools for a Streamable HTTP server
      * @param appName The application name
      * @param serverName The server name
      * @param forceDiscovery Whether to force discovery even if already in progress
      * @returns Promise that resolves to true if discovery was started, false otherwise
      */
-    async discoverSSEServerTools(appName: string, serverName: string, forceDiscovery = false): Promise<boolean> {
+    async discoverHttpServerTools(appName: string, serverName: string, forceDiscovery = false): Promise<boolean> {
         const serverKey = `${appName}:${serverName}`;
 
         // Check if we're already discovering tools for this server
@@ -1123,7 +1123,7 @@ export class ConfigurationsService extends BaseService {
             return false;
         }
 
-        this.logger.info(`Starting SSE server tool discovery for ${appName}/${serverName}`);
+        this.logger.info(`Starting Streamable HTTP server tool discovery for ${appName}/${serverName}`);
 
         // Mark that we're discovering tools for this server BEFORE starting
         this.discoveringTools.add(serverKey);
@@ -1147,7 +1147,7 @@ export class ConfigurationsService extends BaseService {
             }
 
             if (!('url' in server.config)) {
-                this.logger.error(`Server ${serverName} is not an SSE server`);
+                this.logger.error(`Server ${serverName} is not a Streamable HTTP server`);
                 this.discoveringTools.delete(serverKey);
                 return false;
             }

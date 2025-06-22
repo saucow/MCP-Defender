@@ -260,7 +260,7 @@ export abstract class BaseMCPConfiguration {
 
         // Use the app name from the configuration path if not provided
         const effectiveAppName = appName || path.basename(this.getConfigPath(), '.json');
-        logger.debug(`Protecting ${serverCount} servers for app: ${effectiveAppName}, SSE proxying: ${enableSSEProxying}`);
+        logger.debug(`Protecting ${serverCount} servers for app: ${effectiveAppName}, Streamable HTTP proxying: ${enableSSEProxying}`);
 
         // We need to track renamed servers to update the object after iteration
         const renamedServers: Array<{ oldKey: string, newKey: string, server: any }> = [];
@@ -275,16 +275,17 @@ export abstract class BaseMCPConfiguration {
                 renamedServers.push({ oldKey: key, newKey, server });
             }
 
-            // Handle SSE servers
+            // Handle HTTP/HTTPS servers (Streamable HTTP transport)
             if ('url' in server) {
                 if (enableSSEProxying) {
                     // Store original URL
                     const originalUrl = server.url;
-                    logger.debug(`Protecting SSE server: ${key}, original URL: ${originalUrl}`);
+                    logger.debug(`Protecting Streamable HTTP server: ${key}, original URL: ${originalUrl}`);
 
-                    // Update to use our proxy endpoint - include app name in path
-                    // Use original key (not new key) for the URL path to maintain consistency
-                    server.url = `http://localhost:${this.proxyPort}/${effectiveAppName}/${key}/sse`;
+                    // Update to use our Streamable HTTP proxy endpoint
+                    // Format: http://localhost:28173/{appName}/{serverName}
+                    // This follows the 2025-06-18 Streamable HTTP specification
+                    server.url = `http://localhost:${this.proxyPort}/${effectiveAppName}/${key}`;
 
                     // Add metadata - store the original server name
                     server.env = {
@@ -294,12 +295,12 @@ export abstract class BaseMCPConfiguration {
                         [MCPDefenderEnvVar.ServerName]: key // Store original name for internal use
                     };
                 } else {
-                    logger.debug(`Skipping SSE server protection (disabled): ${key}, URL: ${server.url}`);
-                    // Leave SSE server unchanged when proxying is disabled
+                    logger.debug(`Skipping Streamable HTTP server protection (disabled): ${key}, URL: ${server.url}`);
+                    // Leave HTTP server unchanged when proxying is disabled
                 }
             }
 
-            // Handle STDIO servers (always protected regardless of SSE setting)
+            // Handle STDIO servers (always protected regardless of HTTP setting)
             if ('command' in server) {
                 // Store original command and args (handle undefined args)
                 const originalCommand = server.command;

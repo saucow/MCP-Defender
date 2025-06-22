@@ -38,7 +38,6 @@
  *     }
  *   }
  * }
- * ```
  */
 
 import http from 'node:http';
@@ -49,6 +48,7 @@ import { verifyToolCall, verifyToolResponse } from '../verification-utils.js';
 import { DefenderState, sendMessageToParent } from '../common/types.js';
 import { DefenderServerEvent } from '../../services/defender/types.js';
 import { getCallKey, trackToolCall, cleanupStaleCalls } from '../utils/tool-call-tracker.js';
+
 
 /**
  * Streamable HTTP session
@@ -107,10 +107,15 @@ export async function handleStreamableHttpTransport(
     const url = new URL(req.url!, `http://${req.headers.host}`);
     const pathname = url.pathname;
 
-    // Parse server and app name from URL path
-    const pathParts = pathname.split('/').filter(p => p);
+    console.log(`Raw URL: ${req.url}`);
+    console.log(`Parsed pathname: ${pathname}`);
+
+    // Parse server and app name from URL path with proper URL decoding
+    const pathParts = pathname.split('/').filter(p => p).map(part => decodeURIComponent(part));
     let serverName: string;
     let appName: string;
+
+    console.log(`Path parts after decoding:`, pathParts);
 
     if (pathParts.length >= 2) {
         appName = pathParts[0];
@@ -125,7 +130,13 @@ export async function handleStreamableHttpTransport(
         return;
     }
 
-    console.log(`Streamable HTTP request: ${req.method} ${pathname} (app: ${appName}, server: ${serverName})`);
+    console.log(`Streamable HTTP request: ${req.method} ${pathname} (app: "${appName}", server: "${serverName}")`);
+
+    // Handle OAuth discovery endpoints by forwarding to target server
+    if (pathname.includes('/.well-known/oauth-')) {
+        await handleOAuthDiscoveryRequest(req, res, appName, serverName);
+        return;
+    }
 
     // Route to appropriate handler based on HTTP method
     if (req.method === 'GET') {
@@ -139,6 +150,64 @@ export async function handleStreamableHttpTransport(
         res.setHeader('Allow', 'GET, POST, DELETE');
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify({ error: 'Method not allowed' }));
+    }
+}
+
+/**
+ * Handle OAuth discovery requests by forwarding to target server
+ */
+async function handleOAuthDiscoveryRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    appName: string,
+    serverName: string
+) {
+    console.log(`OAuth discovery request: ${req.method} ${req.url}`);
+
+    const targetUrl = getTargetUrlForServer(appName, serverName);
+    if (!targetUrl) {
+        console.error(`No target URL configured for ${appName}/${serverName}`);
+        res.statusCode = 404;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: 'Server not configured' }));
+        return;
+    }
+
+    try {
+        // Extract the well-known path from the request URL
+        const url = new URL(req.url!, `http://${req.headers.host}`);
+        const wellKnownPath = url.pathname.substring(url.pathname.indexOf('/.well-known/'));
+
+        // Construct target URL for the well-known endpoint
+        const targetWellKnownUrl = new URL(wellKnownPath, targetUrl).toString();
+
+        console.log(`Forwarding OAuth discovery to: ${targetWellKnownUrl}`);
+
+        // Forward the request to the target server
+        const response = await fetch(targetWellKnownUrl, {
+            method: req.method,
+            headers: {
+                'Accept': req.headers.accept || 'application/json',
+                'User-Agent': req.headers['user-agent'] || 'MCP-Defender/1.0'
+            }
+        });
+
+        // Forward the response
+        res.statusCode = response.status;
+
+        // Copy response headers
+        response.headers.forEach((value, key) => {
+            res.setHeader(key, value);
+        });
+
+        const responseBody = await response.text();
+        res.end(responseBody);
+
+    } catch (error) {
+        console.error('Error forwarding OAuth discovery request:', error);
+        res.statusCode = 500;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: 'Failed to forward OAuth discovery request' }));
     }
 }
 
@@ -219,9 +288,9 @@ async function handleStreamableHttpPost(
         try {
             const message = JSON.parse(body);
 
-            // Handle initialization request specially
+            // Handle initialization request specially - no session ID required
             if (message.method === 'initialize') {
-                await handleInitializeRequest(req, res, message, serverName, appName);
+                await handleInitializeRequest(req, res, message, serverName, appName, state);
                 return;
             }
 
@@ -232,7 +301,7 @@ async function handleStreamableHttpPost(
                 res.setHeader('Content-Type', 'application/json');
                 res.end(JSON.stringify({
                     jsonrpc: '2.0',
-                    id: message.id,
+                    id: message.id || null,
                     error: { code: -32000, message: 'Mcp-Session-Id header required' }
                 }));
                 return;
@@ -244,7 +313,7 @@ async function handleStreamableHttpPost(
                 res.setHeader('Content-Type', 'application/json');
                 res.end(JSON.stringify({
                     jsonrpc: '2.0',
-                    id: message.id,
+                    id: message.id || null,
                     error: { code: -32000, message: 'Session not found' }
                 }));
                 return;
@@ -321,16 +390,20 @@ async function handleInitializeRequest(
     res: http.ServerResponse,
     message: any,
     serverName: string,
-    appName: string
+    appName: string,
+    state: DefenderState
 ) {
     console.log(`Initialize request for ${appName}/${serverName}`);
+    console.log(`Request headers:`, req.headers);
+    console.log(`Initialize message:`, message);
 
     // Generate session ID
     const sessionId = generateSecureRandom();
 
     // Determine target URL from configuration
-    const targetUrl = getTargetUrlForServer(appName, serverName);
+    const targetUrl = getTargetUrlForServer(appName, serverName, state);
     if (!targetUrl) {
+        console.error(`No target URL configured for ${appName}/${serverName}`);
         res.statusCode = 400;
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify({
@@ -340,6 +413,8 @@ async function handleInitializeRequest(
         }));
         return;
     }
+
+    console.log(`Using target URL: ${targetUrl}`);
 
     // Create session
     const session: StreamableSession = {
@@ -355,6 +430,25 @@ async function handleInitializeRequest(
     const initResult = await initializeTargetConnection(session, message, req.headers);
 
     if (!initResult.success) {
+        console.error(`Failed to initialize target connection: ${initResult.error}`);
+
+        // Handle OAuth discovery (401 responses) specially
+        if (initResult.statusCode === 401 && initResult.headers && initResult.body) {
+            console.log('Forwarding OAuth discovery response to client');
+            res.statusCode = 401;
+
+            // Forward all headers from target server for OAuth discovery
+            Object.keys(initResult.headers).forEach(key => {
+                if (initResult.headers![key]) {
+                    res.setHeader(key, initResult.headers![key]);
+                }
+            });
+
+            res.end(initResult.body);
+            return;
+        }
+
+        // Handle other errors normally
         res.statusCode = 500;
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify({
@@ -367,6 +461,7 @@ async function handleInitializeRequest(
 
     // Store session and return success response
     sessions.set(sessionId, session);
+    console.log(`Session created successfully: ${sessionId}`);
 
     res.statusCode = 200;
     res.setHeader('Content-Type', 'application/json');
@@ -384,7 +479,10 @@ async function initializeTargetConnection(
 ): Promise<{
     success: boolean;
     response?: any;
-    error?: string
+    error?: string;
+    statusCode?: number;
+    headers?: Record<string, string>;
+    body?: string;
 }> {
     try {
         console.log(`Initializing connection to target: ${session.targetUrl}`);
@@ -418,6 +516,17 @@ async function initializeTargetConnection(
         });
 
         if (!response.ok) {
+            // For 401 responses, we need to forward OAuth discovery information
+            if (response.status === 401) {
+                const responseBody = await response.text();
+                return {
+                    success: false,
+                    error: 'OAuth authentication required',
+                    statusCode: 401,
+                    headers: Object.fromEntries(response.headers.entries()),
+                    body: responseBody
+                };
+            }
             return { success: false, error: `Target server returned ${response.status}` };
         }
 
@@ -898,10 +1007,22 @@ async function forwardToTargetServer(
             res.end();
         } else {
             // Handle JSON response
-            const data = await response.json();
+            let data;
+            let responseText;
+            try {
+                responseText = await response.text();
+                if (responseText.trim()) {
+                    data = JSON.parse(responseText);
+                } else {
+                    data = null;
+                }
+            } catch (error) {
+                console.error('Error parsing response JSON:', error);
+                data = null;
+            }
 
             // Verify tool response if this is a tools/call response
-            if (message.method === 'tools/call' && data.result) {
+            if (message.method === 'tools/call' && data?.result) {
                 const shouldBlock = await verifyToolResponseInJson(data, message, session);
                 if (shouldBlock) {
                     res.statusCode = 200;
@@ -918,9 +1039,15 @@ async function forwardToTargetServer(
                 }
             }
 
-            res.statusCode = 200;
-            res.setHeader('Content-Type', 'application/json');
-            res.end(JSON.stringify(data));
+            res.statusCode = response.status;
+            res.setHeader('Content-Type', response.headers.get('content-type') || 'application/json');
+
+            if (data !== null) {
+                res.end(JSON.stringify(data));
+            } else {
+                // If we couldn't parse JSON, send the original response text
+                res.end(responseText || '');
+            }
         }
     } catch (error) {
         console.error('Error forwarding to target server:', error);
@@ -935,12 +1062,58 @@ async function forwardToTargetServer(
 }
 
 /**
- * Get target URL for a server
+ * Get target URL for a server from the configuration service
+ * This looks up the original URL that was stored when the server was protected
  */
-function getTargetUrlForServer(appName: string, serverName: string): string | null {
+function getTargetUrlForServer(appName: string, serverName: string, state?: DefenderState): string | null {
+    // Try to get from the DefenderState's protected servers if available
+    if (state?.protectedServers) {
+        const appServers = state.protectedServers.get(appName);
+        if (appServers) {
+            const server = appServers.find(s => s.serverName === serverName);
+            if (server) {
+                const originalUrl = server.config.env?.['MCP_DEFENDER_ORIGINAL_URL'];
+                if (originalUrl) {
+                    console.log(`Found target URL from protected servers: ${originalUrl}`);
+                    return originalUrl;
+                }
+            }
+        }
+    }
+
+    // Check hardcoded mapping
     const key = `${appName}:${serverName}`;
     const config = serverConfigs.get(key);
-    return config?.targetUrl || null;
+
+    if (config) {
+        return config.targetUrl;
+    }
+
+    // Try to get from environment variables (MCP Defender configuration pattern)
+    const envVarName = `MCP_DEFENDER_ORIGINAL_URL`;
+    const envUrl = process.env[envVarName];
+    if (envUrl) {
+        console.log(`Found target URL in environment: ${envUrl}`);
+        return envUrl;
+    }
+
+    // Fallback for common servers
+    if (appName === 'github' && serverName === 'mcp') {
+        return 'https://api.githubcopilot.com/mcp';
+    }
+
+    // VS Code GitHub MCP server
+    if (appName === 'Visual Studio Code' && serverName === 'github-mcp-server') {
+        return 'https://api.githubcopilot.com/mcp/';
+    }
+
+    // Another common pattern
+    if (appName.toLowerCase().includes('vscode') && serverName.includes('github')) {
+        return 'https://api.githubcopilot.com/mcp/';
+    }
+
+    console.warn(`No target URL configured for ${appName}/${serverName}`);
+    return null;
 }
 
 /**
